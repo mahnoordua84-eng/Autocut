@@ -1,5 +1,9 @@
 package com.example.domain.model
 
+import com.example.engine.index.ClipOverlap
+import com.example.engine.index.MasterTimelineIndex
+import com.example.engine.index.TimeInterval
+import com.example.engine.index.TrackSpatialIndex
 import java.util.UUID
 import kotlin.math.roundToLong
 
@@ -268,18 +272,88 @@ enum class TransitionAlignment {
 }
 
 /**
- * Professional Timeline Transition model with microsecond precision.
+ * Professional Timeline Transition model with microsecond precision,
+ * parameter controls, alignment modes, and progress calculation.
  */
 data class TimelineTransition(
   val id: String = UUID.randomUUID().toString(),
   val fromClipId: String? = null,
   val toClipId: String? = null,
+  val trackId: String? = null,
+  val cutPositionUs: Long? = null,
   val type: TransitionType = TransitionType.FADE,
   val durationUs: Long = 500_000L,
-  val alignment: TransitionAlignment = TransitionAlignment.CENTER
+  val alignment: TransitionAlignment = TransitionAlignment.CENTER,
+  val customParams: Map<String, Float> = emptyMap(),
+  val isPreviewing: Boolean = false,
+  val soundEffectName: String? = null
 ) {
   val durationMs: Long get() = durationUs / 1000L
+
+  /**
+   * Computes the absolute start timestamp of this transition in timeline microseconds.
+   */
+  fun calculateStartUs(cutTimeUs: Long): Long {
+    return when (alignment) {
+      TransitionAlignment.START_AT_CUT -> cutTimeUs
+      TransitionAlignment.CENTER -> cutTimeUs - (durationUs / 2L)
+      TransitionAlignment.END_AT_CUT -> cutTimeUs - durationUs
+    }.coerceAtLeast(0L)
+  }
+
+  /**
+   * Computes the absolute end timestamp of this transition in timeline microseconds.
+   */
+  fun calculateEndUs(cutTimeUs: Long): Long {
+    return calculateStartUs(cutTimeUs) + durationUs
+  }
+
+  /**
+   * Determines if this transition is active at a given timeline position.
+   */
+  fun isActiveAt(timelineUs: Long, cutTimeUs: Long): Boolean {
+    val startUs = calculateStartUs(cutTimeUs)
+    val endUs = calculateEndUs(cutTimeUs)
+    return timelineUs in startUs until endUs
+  }
+
+  /**
+   * Calculates normalized transition progress [0.0f..1.0f] at timestamp [timelineUs].
+   */
+  fun getProgressAt(timelineUs: Long, cutTimeUs: Long): Float {
+    val startUs = calculateStartUs(cutTimeUs)
+    if (timelineUs <= startUs) return 0f
+    val endUs = calculateEndUs(cutTimeUs)
+    if (timelineUs >= endUs) return 1f
+    val dt = (endUs - startUs).coerceAtLeast(1L)
+    return ((timelineUs - startUs).toFloat() / dt.toFloat()).coerceIn(0f, 1f)
+  }
 }
+
+/**
+ * Group of timeline clips that move, transform, and lock together
+ * while strictly preserving relative inter-clip timing offsets.
+ */
+data class TimelineGroup(
+  val id: String = UUID.randomUUID().toString(),
+  val name: String = "Group",
+  val clipIds: Set<String> = emptySet(),
+  val isLocked: Boolean = false,
+  val isHidden: Boolean = false,
+  val colorTag: Long = 0xFF3B82F6,
+  val metadata: Map<String, String> = emptyMap()
+)
+
+/**
+ * Metadata payload for a Compound / Nested Clip.
+ */
+data class CompoundPayload(
+  val originalTrackCount: Int = 1,
+  val originalClipCount: Int = 1,
+  val naturalDurationUs: Long = 0L,
+  val colorTag: Long = 0xFF8B5CF6,
+  val customLabel: String = "Compound Clip"
+)
 
 /**
  * Complete, robust Non-Linear Timeline Clip model.
@@ -305,6 +379,7 @@ data class TimelineTransition(
  * - audio effects
  * - transitions
  * - nested timeline (for compound clips)
+ * - grouping and group ID
  */
 data class TimelineClip(
   val id: String = UUID.randomUUID().toString(),
@@ -329,6 +404,9 @@ data class TimelineClip(
   val isMuted: Boolean = false,
   val isReversed: Boolean = false,
   val freezeFrameAtUs: Long? = null,
+  val groupId: String? = null,
+  val isCompound: Boolean = false,
+  val compoundPayload: CompoundPayload? = null,
   val keyframes: List<ClipKeyframe> = emptyList(),
   val speedCurve: SpeedCurve = SpeedCurve(),
   val audioEffects: AudioEffectsSettings = AudioEffectsSettings(),
@@ -341,7 +419,10 @@ data class TimelineClip(
   val textPayload: TextPayload? = null,
   val effectPayload: EffectPayload? = null,
   val stickerPayload: StickerPayload? = null
-) {
+) : TimeInterval {
+  override val startUs: Long get() = timelineStartUs
+  override val endUs: Long get() = timelineEndUs
+
   // Convenient time accessors
   val timelineEndUs: Long get() = timelineStartUs + timelineDurationUs
   val timelineStartMs: Long get() = timelineStartUs / 1000L
@@ -398,79 +479,45 @@ data class TimelineTrack(
   val clips: List<TimelineClip> = emptyList(),
   val metadata: Map<String, String> = emptyMap()
 ) {
+  val spatialIndex: TrackSpatialIndex
+    get() = TrackSpatialIndex.getOrBuild(this)
+
   val durationUs: Long
-    get() = clips.maxOfOrNull { it.timelineEndUs } ?: 0L
+    get() = spatialIndex.cachedDurationUs
 
   val durationMs: Long
     get() = durationUs / 1000L
 
   /**
    * Retrieve all clips active at the given timeline timestamp.
-   * Multiple clips may be returned if overlapping clips exist on this track.
+   * Accelerated by IntervalTree binary search in O(log N + K).
    */
   fun getClipsAt(timelineUs: Long): List<TimelineClip> {
     if (isHidden) return emptyList()
-    return clips.filter { it.isEnabled && it.containsTimelineTime(timelineUs) }
+    return spatialIndex.getClipsAt(timelineUs)
   }
 
   /**
-   * Identifies all overlapping clip pairs on this track.
+   * Visible range query for viewport culling on this track in O(log N + K).
+   */
+  fun getClipsInRange(startUs: Long, endUs: Long): List<TimelineClip> {
+    if (isHidden) return emptyList()
+    return spatialIndex.getClipsInRange(startUs, endUs)
+  }
+
+  /**
+   * Identifies all overlapping clip pairs on this track using sweep-line algorithm with cached evaluation.
    */
   fun findOverlaps(): List<Pair<TimelineClip, TimelineClip>> {
-    val overlaps = mutableListOf<Pair<TimelineClip, TimelineClip>>()
-    val sorted = clips.sortedBy { it.timelineStartUs }
-    for (i in 0 until sorted.size) {
-      for (j in (i + 1) until sorted.size) {
-        val a = sorted[i]
-        val b = sorted[j]
-        if (a.intersects(b)) {
-          overlaps.add(a to b)
-        } else if (b.timelineStartUs >= a.timelineEndUs) {
-          break
-        }
-      }
-    }
-    return overlaps
+    return spatialIndex.findOverlaps().map { it.first to it.second }
   }
 
   /**
    * Finds all empty gaps between clips on this track up to the provided total duration.
+   * Results are cached to prevent repeated allocations.
    */
   fun findGaps(totalDurationUs: Long = this.durationUs): List<TimelineGap> {
-    if (clips.isEmpty()) {
-      return if (totalDurationUs > 0L) {
-        listOf(TimelineGap(trackId = id, startUs = 0L, durationUs = totalDurationUs))
-      } else emptyList()
-    }
-
-    val gaps = mutableListOf<TimelineGap>()
-    val sorted = clips.sortedBy { it.timelineStartUs }
-
-    var currentHeadUs = 0L
-    for (clip in sorted) {
-      if (clip.timelineStartUs > currentHeadUs) {
-        gaps.add(
-          TimelineGap(
-            trackId = id,
-            startUs = currentHeadUs,
-            durationUs = clip.timelineStartUs - currentHeadUs
-          )
-        )
-      }
-      currentHeadUs = maxOf(currentHeadUs, clip.timelineEndUs)
-    }
-
-    if (totalDurationUs > currentHeadUs) {
-      gaps.add(
-        TimelineGap(
-          trackId = id,
-          startUs = currentHeadUs,
-          durationUs = totalDurationUs - currentHeadUs
-        )
-      )
-    }
-
-    return gaps
+    return spatialIndex.findGaps(totalDurationUs)
   }
 }
 
@@ -500,6 +547,7 @@ data class CoreTimelineState(
   val tracks: List<TimelineTrack> = emptyList(),
   val trackOrder: List<String> = emptyList(), // Explicit list of track IDs in display order
   val transitions: List<TimelineTransition> = emptyList(),
+  val groups: List<TimelineGroup> = emptyList(),
   val adjustments: VideoAdjustments = VideoAdjustments(),
   val filter: FilterSettings = FilterSettings(),
   val chromaKey: ChromaKeySettings = ChromaKeySettings(),
@@ -522,6 +570,9 @@ data class CoreTimelineState(
     return ordered + remaining
   }
 
+  val spatialIndex: MasterTimelineIndex
+    get() = MasterTimelineIndex.getOrBuild(this)
+
   /**
    * Flattened list of all clips across all tracks.
    */
@@ -529,16 +580,18 @@ data class CoreTimelineState(
 
   /**
    * Look up a clip by its unique ID.
+   * Accelerated in O(1) via MasterTimelineIndex.
    */
   fun findClip(clipId: String): TimelineClip? {
-    return allClips().firstOrNull { it.id == clipId }
+    return spatialIndex.findClip(clipId)
   }
 
   /**
    * Look up which track contains a clip by clip ID.
+   * Accelerated in O(1) via MasterTimelineIndex.
    */
   fun findTrackForClip(clipId: String): TimelineTrack? {
-    return tracks.firstOrNull { track -> track.clips.any { it.id == clipId } }
+    return spatialIndex.findTrackForClip(clipId)
   }
 
   /**
@@ -550,6 +603,34 @@ data class CoreTimelineState(
 
   fun getTrackById(trackId: String): TimelineTrack? = findTrackById(trackId)
 
+  /**
+   * Look up a group by its ID.
+   */
+  fun findGroup(groupId: String): TimelineGroup? {
+    return groups.firstOrNull { it.id == groupId }
+  }
+
+  /**
+   * Look up the group that contains a clip by clip ID.
+   */
+  fun findGroupForClip(clipId: String): TimelineGroup? {
+    return groups.firstOrNull { it.clipIds.contains(clipId) }
+  }
+
+  /**
+   * Look up transition by its ID.
+   */
+  fun findTransitionById(transitionId: String): TimelineTransition? {
+    return transitions.firstOrNull { it.id == transitionId }
+  }
+
+  /**
+   * Find transitions associated with a clip (either as outgoing or incoming).
+   */
+  fun findTransitionsForClip(clipId: String): List<TimelineTransition> {
+    return transitions.filter { it.fromClipId == clipId || it.toClipId == clipId }
+  }
+
   fun reorderTracks(newOrder: List<String>): CoreTimelineState {
     val trackMap = tracks.associateBy { it.id }
     val ordered = newOrder.mapNotNull { trackMap[it] }.mapIndexed { idx, t -> t.copy(orderIndex = idx) }
@@ -560,16 +641,33 @@ data class CoreTimelineState(
 
   /**
    * Returns all active clips at current playhead position.
+   * Accelerated by IntervalTree in O(log N + K).
    */
   fun getClipsAtPlayhead(): List<TimelineClip> {
-    return tracks.flatMap { it.getClipsAt(playheadPositionUs) }
+    return spatialIndex.getClipsAtPlayhead(playheadPositionUs)
+  }
+
+  /**
+   * Visible range query for viewport culling across all tracks in O(log N + K).
+   */
+  fun getClipsInVisibleRange(startUs: Long, endUs: Long): List<TimelineClip> {
+    return spatialIndex.getClipsInVisibleRange(startUs, endUs)
   }
 
   /**
    * Returns all empty gaps across all tracks up to timeline duration.
+   * Uses cached evaluation.
    */
   fun findAllGaps(): List<TimelineGap> {
-    return tracks.flatMap { it.findGaps(durationUs) }
+    return spatialIndex.findAllGaps(durationUs)
+  }
+
+  /**
+   * Returns all overlapping clip pairs grouped by track ID.
+   * Uses cached sweep-line evaluation.
+   */
+  fun findAllOverlaps(): Map<String, List<ClipOverlap<TimelineClip>>> {
+    return spatialIndex.findAllOverlaps()
   }
 
   /**

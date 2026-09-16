@@ -17,6 +17,28 @@ val AudioClip.sourceInUs: Long get() = sourceStartMs * 1000L
 val AudioClip.sourceOutUs: Long get() = sourceEndMs * 1000L
 
 val TextClip.timelineStartUs: Long get() = timelineStartMs * 1000L
+/**
+ * In-memory thread-safe registry to preserve compound clip nested timelines and payloads
+ * across two-way legacy-to-core conversions.
+ */
+object CompoundClipRegistry {
+  private val registry = java.util.concurrent.ConcurrentHashMap<String, Pair<CoreTimelineState, CompoundPayload?>>()
+
+  fun register(clipId: String, nestedTimeline: CoreTimelineState, payload: CompoundPayload?) {
+    registry[clipId] = nestedTimeline to payload
+  }
+
+  fun get(clipId: String): Pair<CoreTimelineState, CompoundPayload?>? = registry[clipId]
+
+  fun remove(clipId: String) {
+    registry.remove(clipId)
+  }
+
+  fun clear() {
+    registry.clear()
+  }
+}
+
 val TextClip.durationUs: Long get() = durationMs * 1000L
 val TextClip.timelineEndUs: Long get() = (timelineStartMs + durationMs) * 1000L
 
@@ -34,6 +56,9 @@ val Timeline.totalDurationUs: Long get() = totalDurationMs * 1000L
  * Converts a legacy VideoClip to a modern TimelineClip.
  */
 fun VideoClip.toTimelineClip(trackId: String, isOverlay: Boolean = false): TimelineClip {
+  val compoundData = CompoundClipRegistry.get(id)
+  val isCompoundClip = compoundData != null || uri.startsWith("compound://")
+
   return TimelineClip(
     id = id,
     sourceMediaId = uri,
@@ -66,7 +91,8 @@ fun VideoClip.toTimelineClip(trackId: String, isOverlay: Boolean = false): Timel
       "width" to width.toString(),
       "height" to height.toString(),
       "frameRate" to frameRate.toString(),
-      "hasAudio" to hasAudio.toString()
+      "hasAudio" to hasAudio.toString(),
+      "isCompound" to isCompoundClip.toString()
     ),
     blendMode = blendMode,
     isLocked = isLocked,
@@ -78,7 +104,10 @@ fun VideoClip.toTimelineClip(trackId: String, isOverlay: Boolean = false): Timel
     audioEffects = audioEffects,
     filter = filter,
     mask = mask,
-    animation = animation
+    animation = animation,
+    isCompound = isCompoundClip,
+    nestedTimeline = compoundData?.first,
+    compoundPayload = compoundData?.second
   )
 }
 
@@ -86,6 +115,10 @@ fun VideoClip.toTimelineClip(trackId: String, isOverlay: Boolean = false): Timel
  * Converts a modern TimelineClip back to a legacy VideoClip.
  */
 fun TimelineClip.toLegacyVideoClip(): VideoClip {
+  if (isCompound && nestedTimeline != null) {
+    CompoundClipRegistry.register(id, nestedTimeline, compoundPayload)
+  }
+
   return VideoClip(
     id = id,
     uri = sourceMediaId.ifBlank { metadata["uri"] ?: "" },
@@ -417,15 +450,42 @@ fun TimelineClip.toLegacyEffectClip(): EffectClip {
   )
 }
 
+private data class ConversionCacheKey(
+  val timeline: Timeline,
+  val fps: Int,
+  val resolution: TimelineResolution
+)
+
+private val coreTimelineConversionCache = java.util.concurrent.ConcurrentHashMap<ConversionCacheKey, CoreTimelineState>()
+
 /**
  * Two-way conversion: Converts existing legacy Timeline into modern CoreTimelineState.
  * Automatically builds tracks for VIDEO, OVERLAY, AUDIO, TEXT, IMAGE, EFFECT, and ADJUSTMENT.
+ * Utilizes memoized conversion caching to avoid allocations on playhead changes.
  */
 fun Timeline.toCoreTimeline(
   fps: Int = 30,
   resolution: TimelineResolution = TimelineResolution.FULL_HD_1080P,
   currentPlayheadMs: Long = 0L
 ): CoreTimelineState {
+  val key = ConversionCacheKey(this, fps, resolution)
+  val baseState = coreTimelineConversionCache.computeIfAbsent(key) {
+    buildCoreTimelineInternal(it.timeline, it.fps, it.resolution)
+  }
+  val totalDurUs = baseState.durationUs
+  val playheadUs = (currentPlayheadMs * 1000L).coerceIn(0L, maxOf(1000L, totalDurUs))
+  return if (baseState.playheadPositionUs == playheadUs) {
+    baseState
+  } else {
+    baseState.copy(playheadPositionUs = playheadUs)
+  }
+}
+
+private fun buildCoreTimelineInternal(
+  timeline: Timeline,
+  fps: Int,
+  resolution: TimelineResolution
+): CoreTimelineState = with(timeline) {
   val trackVideoId = "track_main_video"
   val trackOverlayId = "track_overlay"
   val trackAudioId = "track_audio"
@@ -546,11 +606,10 @@ fun Timeline.toCoreTimeline(
   }
 
   val totalDurUs = totalDurationMs * 1000L
-  val playheadUs = (currentPlayheadMs * 1000L).coerceIn(0L, maxOf(1000L, totalDurUs))
 
-  return CoreTimelineState(
+  CoreTimelineState(
     durationUs = totalDurUs,
-    playheadPositionUs = playheadUs,
+    playheadPositionUs = 0L,
     timebase = Timebase.fromFps(fps),
     fps = FrameRate.FPS_30,
     resolution = resolution,

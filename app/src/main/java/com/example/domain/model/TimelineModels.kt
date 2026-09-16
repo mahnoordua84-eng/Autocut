@@ -1,5 +1,6 @@
 package com.example.domain.model
 
+import com.example.engine.index.LegacyTimelineIndex
 import java.util.UUID
 
 enum class KeyframeInterpolation(val displayName: String) {
@@ -728,14 +729,31 @@ data class Timeline(
   val aspectRatio: AspectRatio = AspectRatio.RATIO_9_16,
   val trackSettings: Map<TrackType, TrackSettings> = defaultTrackSettings()
 ) {
+  val legacyIndex: LegacyTimelineIndex
+    get() = LegacyTimelineIndex.getOrBuild(this)
+
   val totalDurationMs: Long
-    get() {
-      val videoDur = videoClips.maxOfOrNull { it.timelineStartMs + it.durationMs } ?: 0L
-      val overlayDur = overlayClips.maxOfOrNull { it.timelineStartMs + it.durationMs } ?: 0L
-      val audioDur = audioClips.maxOfOrNull { it.timelineStartMs + it.durationMs } ?: 0L
-      val textDur = textClips.maxOfOrNull { it.timelineStartMs + it.durationMs } ?: 0L
-      val stickerDur = stickerClips.maxOfOrNull { it.timelineStartMs + it.durationMs } ?: 0L
-      val effectDur = effectClips.maxOfOrNull { it.timelineStartMs + it.durationMs } ?: 0L
-      return maxOf(videoDur, overlayDur, audioDur, textDur, stickerDur, effectDur)
-    }
+    get() = legacyIndex.cachedDurationMs
+
+  fun findClip(id: String): Any? = legacyIndex.findClip(id)
+  fun findClipUnderPlayhead(posMs: Long): String? = legacyIndex.findClipUnderPlayhead(posMs)
+  fun findVideoClipAt(posMs: Long): VideoClip? = legacyIndex.findVideoClipAt(posMs)
+
+  fun getVisibleVideoClips(startMs: Long, endMs: Long): List<VideoClip> =
+    legacyIndex.getVisibleVideoClips(startMs, endMs)
+
+  fun getVisibleOverlayClips(startMs: Long, endMs: Long): List<VideoClip> =
+    legacyIndex.getVisibleOverlayClips(startMs, endMs)
+
+  fun getVisibleAudioClips(startMs: Long, endMs: Long): List<AudioClip> =
+    legacyIndex.getVisibleAudioClips(startMs, endMs)
+
+  fun getVisibleTextClips(startMs: Long, endMs: Long): List<TextClip> =
+    legacyIndex.getVisibleTextClips(startMs, endMs)
+
+  fun getVisibleStickerClips(startMs: Long, endMs: Long): List<StickerClip> =
+    legacyIndex.getVisibleStickerClips(startMs, endMs)
+
+  fun getVisibleEffectClips(startMs: Long, endMs: Long): List<EffectClip> =
+    legacyIndex.getVisibleEffectClips(startMs, endMs)
 }

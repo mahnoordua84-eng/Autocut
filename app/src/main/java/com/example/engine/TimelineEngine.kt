@@ -1,11 +1,14 @@
 package com.example.engine
 
 import com.example.domain.model.*
+import com.example.engine.composition.*
 import com.example.engine.history.TimelineAction
 import com.example.engine.history.TimelineActionManager
 import com.example.engine.history.TimelineActionType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -66,10 +69,12 @@ class TimelineEngine {
   private val _timebase = MutableStateFlow(Timebase.FPS_30)
   val timebase: StateFlow<Timebase> = _timebase.asStateFlow()
 
+  private val engineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
   val coreTimeline: StateFlow<CoreTimelineState> = combine(_timeline, _currentPositionMs, _timelineFps) { tl, pos, fps ->
     tl.toCoreTimeline(fps = fps, currentPlayheadMs = pos)
   }.stateIn(
-    scope = CoroutineScope(Dispatchers.Default),
+    scope = engineScope,
     started = SharingStarted.Eagerly,
     initialValue = _timeline.value.toCoreTimeline()
   )
@@ -77,7 +82,7 @@ class TimelineEngine {
   val validationReport: StateFlow<TimelineValidationReport> = coreTimeline.map {
     TimelineValidator.validateTimeline(it)
   }.stateIn(
-    scope = CoroutineScope(Dispatchers.Default),
+    scope = engineScope,
     started = SharingStarted.Eagerly,
     initialValue = TimelineValidationReport.VALID
   )
@@ -126,6 +131,16 @@ class TimelineEngine {
   // Track synchronization (All tracks move and edit together synchronously with CTI)
   private val _isTracksSyncEnabled = MutableStateFlow(true)
   val isTracksSyncEnabled: StateFlow<Boolean> = _isTracksSyncEnabled.asStateFlow()
+
+  // Layer Isolation (solo / inspect a specific layer or track ID)
+  private val _isolatedLayer = MutableStateFlow<String?>(null)
+  val isolatedLayer: StateFlow<String?> = _isolatedLayer.asStateFlow()
+
+  fun setIsolatedLayer(clipOrTrackId: String?) = withStateLock {
+    _isolatedLayer.value = clipOrTrackId
+  }
+
+  fun getIsolatedLayer(): String? = _isolatedLayer.value
 
   fun setTracksSyncEnabled(enabled: Boolean) = withStateLock {
     _isTracksSyncEnabled.value = enabled
@@ -315,9 +330,13 @@ class TimelineEngine {
     } else {
       positionUs
     }
-    val targetMs = targetUs / 1000L
-    val snappedMs = if (snap) snapPosition(targetMs) else targetMs
-    val finalUs = if (totalUs > 0L) (snappedMs * 1000L).coerceIn(0L, totalUs) else (snappedMs * 1000L).coerceAtLeast(0L)
+    val finalUs = if (snap) {
+      val targetMs = targetUs / 1000L
+      val snappedMs = snapPosition(targetMs)
+      if (totalUs > 0L) (snappedMs * 1000L).coerceIn(0L, totalUs) else (snappedMs * 1000L).coerceAtLeast(0L)
+    } else {
+      if (totalUs > 0L) targetUs.coerceIn(0L, totalUs) else targetUs.coerceAtLeast(0L)
+    }
     _currentPositionUs.value = finalUs
     _currentPositionMs.value = finalUs / 1000L
   }
@@ -739,72 +758,18 @@ class TimelineEngine {
     ignoreClipIds: Set<String> = emptySet()
   ): SnapResult {
     if (!_isSnappingEnabled.value) return SnapResult(candidatePosMs, false, null)
-    val snapPoints = mutableSetOf(0L, _timeline.value.totalDurationMs, _currentPositionMs.value)
-    
-    _timeline.value.videoClips.forEach {
-      if (it.id !in ignoreClipIds) {
-        snapPoints.add(it.timelineStartMs)
-        snapPoints.add(it.timelineStartMs + it.durationMs)
-        it.keyframes.forEach { kf -> snapPoints.add(it.timelineStartMs + kf.timeMs) }
-      }
-    }
-    _timeline.value.transitions.forEach { tr ->
-      val clip = _timeline.value.videoClips.getOrNull(tr.clipIndexBefore)
-      if (clip != null) {
-        val cutMs = clip.timelineStartMs + clip.durationMs
-        snapPoints.add(cutMs - tr.durationMs / 2)
-        snapPoints.add(cutMs + tr.durationMs / 2)
-      }
-    }
-    _timeline.value.overlayClips.forEach {
-      if (it.id !in ignoreClipIds) {
-        snapPoints.add(it.timelineStartMs)
-        snapPoints.add(it.timelineStartMs + it.durationMs)
-        it.keyframes.forEach { kf -> snapPoints.add(it.timelineStartMs + kf.timeMs) }
-      }
-    }
-    _timeline.value.textClips.forEach {
-      if (it.id !in ignoreClipIds) {
-        snapPoints.add(it.timelineStartMs)
-        snapPoints.add(it.timelineStartMs + it.durationMs)
-      }
-    }
-    _timeline.value.audioClips.forEach {
-      if (it.id !in ignoreClipIds) {
-        snapPoints.add(it.timelineStartMs)
-        snapPoints.add(it.timelineStartMs + it.durationMs)
-        it.keyframes.forEach { kf -> snapPoints.add(it.timelineStartMs + kf.timeMs) }
-        // Fast in-memory beat peaks
-        val wave = it.waveformData
-        if (wave != null && wave.isNotEmpty() && !it.isMuted) {
-          val step = (wave.size / 20).coerceAtLeast(1)
-          for (i in 0 until wave.size step step) {
-            if (wave[i] > 0.8f) {
-              val beatTimeMs = (i.toFloat() / wave.size * it.durationMs).toLong()
-              snapPoints.add(it.timelineStartMs + beatTimeMs)
-            }
-          }
-        }
-      }
-    }
-    _timeline.value.stickerClips.forEach {
-      if (it.id !in ignoreClipIds) {
-        snapPoints.add(it.timelineStartMs)
-        snapPoints.add(it.timelineStartMs + it.durationMs)
-        it.keyframes.forEach { kf -> snapPoints.add(it.timelineStartMs + kf.timeMs) }
-      }
-    }
-    _timeline.value.effectClips.forEach {
-      if (it.id !in ignoreClipIds) {
-        snapPoints.add(it.timelineStartMs)
-        snapPoints.add(it.timelineStartMs + it.durationMs)
-        it.keyframes.forEach { kf -> snapPoints.add(it.timelineStartMs + kf.timeMs) }
-      }
-    }
-    
     val effectiveThreshold = (thresholdMs / _timelineZoom.value.coerceIn(0.5f, 4.0f)).toLong().coerceIn(30L, 200L)
-    val closest = snapPoints.minByOrNull { kotlin.math.abs(it - candidatePosMs) } ?: candidatePosMs
-    return if (kotlin.math.abs(closest - candidatePosMs) <= effectiveThreshold) {
+    val currentPos = _currentPositionMs.value
+    val snapIndex = _timeline.value.legacyIndex.snapIndex
+
+    val closest = snapIndex.findClosestSnap(
+      candidatePosMs = candidatePosMs,
+      thresholdMs = effectiveThreshold,
+      ignoreClipIds = ignoreClipIds,
+      additionalPoints = longArrayOf(currentPos, _timeline.value.totalDurationMs)
+    )
+
+    return if (closest != null && kotlin.math.abs(closest - candidatePosMs) <= effectiveThreshold) {
       _snapIndicatorMs.value = closest
       SnapResult(closest, true, closest)
     } else {
@@ -1478,6 +1443,178 @@ class TimelineEngine {
     _timeline.value = _timeline.value.copy(trackSettings = settings)
   }
 
+  // --- Professional Multi-Layer Compositing Controls ---
+
+  fun setTrackSolo(trackType: TrackType, isSolo: Boolean) = withStateLock {
+    recordHistory()
+    val settings = _timeline.value.trackSettings.toMutableMap()
+    val cur = settings[trackType] ?: TrackSettings(trackType)
+    settings[trackType] = cur.copy(isSolo = isSolo)
+    _timeline.value = _timeline.value.copy(trackSettings = settings)
+  }
+
+  fun setTrackMute(trackType: TrackType, isMuted: Boolean) = withStateLock {
+    recordHistory()
+    val settings = _timeline.value.trackSettings.toMutableMap()
+    val cur = settings[trackType] ?: TrackSettings(trackType)
+    settings[trackType] = cur.copy(isMuted = isMuted)
+    _timeline.value = _timeline.value.copy(trackSettings = settings)
+  }
+
+  fun setTrackLock(trackType: TrackType, isLocked: Boolean) = withStateLock {
+    recordHistory()
+    val settings = _timeline.value.trackSettings.toMutableMap()
+    val cur = settings[trackType] ?: TrackSettings(trackType)
+    settings[trackType] = cur.copy(isLocked = isLocked)
+    _timeline.value = _timeline.value.copy(trackSettings = settings)
+  }
+
+  fun setTrackVisibility(trackType: TrackType, isVisible: Boolean) = withStateLock {
+    recordHistory()
+    val settings = _timeline.value.trackSettings.toMutableMap()
+    val cur = settings[trackType] ?: TrackSettings(trackType)
+    settings[trackType] = cur.copy(isHidden = !isVisible)
+    _timeline.value = _timeline.value.copy(trackSettings = settings)
+  }
+
+  fun setTrackSolo(trackId: String, isSolo: Boolean) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) {
+      setTrackSolo(trackType, isSolo)
+    }
+  }
+
+  fun setTrackMute(trackId: String, isMuted: Boolean) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) {
+      setTrackMute(trackType, isMuted)
+    }
+  }
+
+  fun setTrackLock(trackId: String, isLocked: Boolean) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) {
+      setTrackLock(trackType, isLocked)
+    }
+  }
+
+  fun setTrackVisibility(trackId: String, isVisible: Boolean) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) {
+      setTrackVisibility(trackType, isVisible)
+    }
+  }
+
+  fun toggleTrackSolo(trackId: String) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) toggleTrackSolo(trackType)
+  }
+
+  fun toggleTrackMute(trackId: String) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) toggleTrackMute(trackType)
+  }
+
+  fun toggleTrackLock(trackId: String) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) toggleTrackLock(trackType)
+  }
+
+  fun toggleTrackVisibility(trackId: String) = withStateLock {
+    val trackType = parseTrackType(trackId)
+    if (trackType != null) toggleTrackHide(trackType)
+  }
+
+  private fun parseTrackType(trackId: String): TrackType? {
+    return when (trackId.lowercase()) {
+      "track_main_video", "main_video", "video" -> TrackType.MAIN_VIDEO
+      "track_overlay", "overlay" -> TrackType.OVERLAY
+      "track_audio", "audio" -> TrackType.AUDIO
+      "track_text", "text" -> TrackType.TEXT
+      "track_stickers", "sticker", "stickers" -> TrackType.STICKER
+      "track_effects", "effect", "effects" -> TrackType.EFFECT
+      else -> null
+    }
+  }
+
+  fun setClipBlendMode(clipId: String, blendMode: String) = withStateLock {
+    recordHistory()
+    val videoUpdated = _timeline.value.videoClips.map {
+      if (it.id == clipId) it.copy(blendMode = blendMode) else it
+    }
+    val overlayUpdated = _timeline.value.overlayClips.map {
+      if (it.id == clipId) it.copy(blendMode = blendMode) else it
+    }
+    _timeline.value = _timeline.value.copy(videoClips = videoUpdated, overlayClips = overlayUpdated)
+  }
+
+  fun setClipOpacity(clipId: String, opacity: Float) = withStateLock {
+    recordHistory()
+    val clamped = opacity.coerceIn(0f, 1f)
+    val videoUpdated = _timeline.value.videoClips.map {
+      if (it.id == clipId) it.copy(opacity = clamped) else it
+    }
+    val overlayUpdated = _timeline.value.overlayClips.map {
+      if (it.id == clipId) it.copy(opacity = clamped) else it
+    }
+    val textUpdated = _timeline.value.textClips.map {
+      if (it.id == clipId) it.copy(opacity = clamped) else it
+    }
+    val stickerUpdated = _timeline.value.stickerClips.map {
+      if (it.id == clipId) it.copy(opacity = clamped) else it
+    }
+    _timeline.value = _timeline.value.copy(
+      videoClips = videoUpdated,
+      overlayClips = overlayUpdated,
+      textClips = textUpdated,
+      stickerClips = stickerUpdated
+    )
+  }
+
+  fun setClipEnabled(clipId: String, isEnabled: Boolean) = withStateLock {
+    recordHistory()
+    val videoUpdated = _timeline.value.videoClips.map {
+      if (it.id == clipId) it.copy(isHidden = !isEnabled) else it
+    }
+    val overlayUpdated = _timeline.value.overlayClips.map {
+      if (it.id == clipId) it.copy(isHidden = !isEnabled) else it
+    }
+    val audioUpdated = _timeline.value.audioClips.map {
+      if (it.id == clipId) it.copy(isHidden = !isEnabled) else it
+    }
+    val textUpdated = _timeline.value.textClips.map {
+      if (it.id == clipId) it.copy(isHidden = !isEnabled) else it
+    }
+    val stickerUpdated = _timeline.value.stickerClips.map {
+      if (it.id == clipId) it.copy(isHidden = !isEnabled) else it
+    }
+    val effectUpdated = _timeline.value.effectClips.map {
+      if (it.id == clipId) it.copy(isHidden = !isEnabled) else it
+    }
+    _timeline.value = _timeline.value.copy(
+      videoClips = videoUpdated,
+      overlayClips = overlayUpdated,
+      audioClips = audioUpdated,
+      textClips = textUpdated,
+      stickerClips = stickerUpdated,
+      effectClips = effectUpdated
+    )
+  }
+
+  fun evaluateMultiLayerComposition(timeMs: Long = _currentPositionMs.value): CompositionFrameDescriptor {
+    val coreState = getCoreTimeline()
+    return LayerCompositor.evaluateComposition(
+      state = coreState,
+      timeUs = timeMs * 1000L,
+      isolatedTrackId = null,
+      isolatedClipId = _isolatedLayer.value
+    )
+  }
+
+  fun getCompositionDescriptorAt(timeMs: Long): CompositionFrameDescriptor {
+    return evaluateMultiLayerComposition(timeMs)
+  }
+
   // --- Advanced Clip Editing & Multi-Track Operations ---
 
   fun trimClipLeft(clipId: String, newStartMs: Long, snap: Boolean = true) {
@@ -2035,6 +2172,196 @@ class TimelineEngine {
     }
   }
 
+  fun rollEdit(outgoingClipId: String, incomingClipId: String, deltaMs: Long): Boolean = withStateLock {
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    val deltaUs = deltaMs * 1000L
+    val updated = TimelineEditOperations.rollEdit(core, outgoingClipId, incomingClipId, deltaUs)
+    if (updated != core) {
+      recordHistory(TimelineActionType.TRIM_RIGHT, "Roll Edit", setOf(outgoingClipId, incomingClipId))
+      _timeline.value = updated.toLegacyTimeline()
+      return true
+    }
+    return false
+  }
+
+  fun rippleTrimLeft(clipId: String, newStartMs: Long, snap: Boolean = true): Boolean = withStateLock {
+    val element = findTrackElementForClip(clipId)
+    if (element == SelectedTrackElement.None) return false
+    val targetStart = if (snap && _isSnappingEnabled.value) calculateSnap(newStartMs, ignoreClipIds = setOf(clipId)).snappedPosMs else newStartMs
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.TRIM_LEFT, "Ripple Trim Left", setOf(clipId))
+    val updated = TimelineEditOperations.trimLeft(core, clipId, targetStart * 1000L, ripple = true, preserveZeroPointLock = true)
+    _timeline.value = updated.toLegacyTimeline()
+    enforceZeroPointLock()
+    return true
+  }
+
+  fun rippleTrimRight(clipId: String, newDurationMs: Long, snap: Boolean = true): Boolean = withStateLock {
+    val element = findTrackElementForClip(clipId)
+    if (element == SelectedTrackElement.None) return false
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.TRIM_RIGHT, "Ripple Trim Right", setOf(clipId))
+    val updated = TimelineEditOperations.trimRight(core, clipId, newDurationMs * 1000L, ripple = true)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun moveClipBetweenTracks(clipId: String, targetTrackType: TrackType, targetStartMs: Long? = null): Boolean = withStateLock {
+    val element = findTrackElementForClip(clipId)
+    if (element == SelectedTrackElement.None) return false
+    if (isTrackLocked(targetTrackType)) return false
+
+    val trackId = when (targetTrackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.MOVE_CLIP, "Move Clip to Track", setOf(clipId))
+    val updated = TimelineEditOperations.moveClipBetweenTracks(
+      core,
+      clipId,
+      trackId,
+      targetStartMs?.let { it * 1000L }
+    )
+    _timeline.value = updated.toLegacyTimeline()
+    _selectedElement.value = findTrackElementForClip(clipId) ?: SelectedTrackElement.None
+    return true
+  }
+
+  fun insertClip(trackType: TrackType, clip: TimelineClip, targetStartMs: Long, mode: InsertMode = InsertMode.RIPPLE): Boolean = withStateLock {
+    if (isTrackLocked(trackType)) return false
+    val trackId = when (trackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Insert Clip", setOf(clip.id))
+    val updated = TimelineEditOperations.insertClip(core, trackId, clip, targetStartMs * 1000L, mode)
+    _timeline.value = updated.toLegacyTimeline()
+    selectElement(findTrackElementForClip(clip.id) ?: SelectedTrackElement.None)
+    return true
+  }
+
+  fun insertEditAtPlayhead(trackType: TrackType, clip: TimelineClip): Boolean {
+    return insertClip(trackType, clip, _currentPositionMs.value, InsertMode.RIPPLE)
+  }
+
+  fun overwriteEditAtPlayhead(trackType: TrackType, clip: TimelineClip): Boolean {
+    return insertClip(trackType, clip, _currentPositionMs.value, InsertMode.OVERWRITE)
+  }
+
+  fun extendClipDuration(clipId: String, deltaMs: Long, ripple: Boolean = false): Boolean = withStateLock {
+    val element = findTrackElementForClip(clipId) ?: return false
+    val currentDur = when (element) {
+      is SelectedTrackElement.Video -> _timeline.value.videoClips.find { it.id == clipId }?.durationMs
+      is SelectedTrackElement.Overlay -> _timeline.value.overlayClips.find { it.id == clipId }?.durationMs
+      is SelectedTrackElement.Audio -> _timeline.value.audioClips.find { it.id == clipId }?.durationMs
+      is SelectedTrackElement.Text -> _timeline.value.textClips.find { it.id == clipId }?.durationMs
+      is SelectedTrackElement.Sticker -> _timeline.value.stickerClips.find { it.id == clipId }?.durationMs
+      is SelectedTrackElement.Effect -> _timeline.value.effectClips.find { it.id == clipId }?.durationMs
+      SelectedTrackElement.None -> null
+    } ?: return false
+    val newDur = (currentDur + deltaMs).coerceAtLeast(100L)
+    return setClipDuration(clipId, newDur, ripple)
+  }
+
+  fun reduceClipDuration(clipId: String, deltaMs: Long, ripple: Boolean = false): Boolean {
+    return extendClipDuration(clipId, -deltaMs, ripple)
+  }
+
+  fun setClipDuration(clipId: String, newDurationMs: Long, ripple: Boolean = false): Boolean = withStateLock {
+    val element = findTrackElementForClip(clipId) ?: return false
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.TRIM_RIGHT, "Change Clip Duration", setOf(clipId))
+    val updated = TimelineEditOperations.trimRight(core, clipId, newDurationMs * 1000L, ripple = ripple)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun setClipSourceRange(clipId: String, sourceStartMs: Long, sourceEndMs: Long, ripple: Boolean = false): Boolean = withStateLock {
+    val element = findTrackElementForClip(clipId) ?: return false
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.TRIM_LEFT, "Set Source In/Out Range", setOf(clipId))
+    val updated = TimelineEditOperations.editSourceRange(
+      core,
+      clipId,
+      sourceStartMs * 1000L,
+      sourceEndMs * 1000L,
+      ripple = ripple
+    )
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun closeGap(trackType: TrackType, gapStartMs: Long, gapDurationMs: Long): Boolean = withStateLock {
+    if (isTrackLocked(trackType) || gapDurationMs <= 0L) return false
+    val trackId = when (trackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.RIPPLE_DELETE, "Close Gap")
+    val updated = TimelineEditOperations.closeGap(core, trackId, gapStartMs * 1000L, gapDurationMs * 1000L)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun insertGap(trackType: TrackType, atMs: Long, gapDurationMs: Long): Boolean = withStateLock {
+    if (isTrackLocked(trackType) || gapDurationMs <= 0L) return false
+    val trackId = when (trackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Insert Gap")
+    val updated = TimelineEditOperations.insertGap(core, trackId, atMs * 1000L, gapDurationMs * 1000L)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun findGapsForTrack(trackType: TrackType): List<TimelineGap> {
+    val trackId = when (trackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    return core.findTrackById(trackId)?.findGaps(core.durationUs) ?: emptyList()
+  }
+
+  fun findOverlapsForTrack(trackType: TrackType): List<Pair<TimelineClip, TimelineClip>> {
+    val trackId = when (trackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    return core.findTrackById(trackId)?.findOverlaps() ?: emptyList()
+  }
+
   private fun isClipAtPlayhead(clipId: String, playhead: Long): Boolean {
     _timeline.value.videoClips.find { it.id == clipId }?.let { return playhead > it.timelineStartMs && playhead < it.timelineStartMs + it.durationMs }
     _timeline.value.overlayClips.find { it.id == clipId }?.let { return playhead > it.timelineStartMs && playhead < it.timelineStartMs + it.durationMs }
@@ -2399,13 +2726,7 @@ class TimelineEngine {
 
   private fun findClipUnderPlayhead(): String? {
     val pos = _currentPositionMs.value
-    _timeline.value.videoClips.find { pos >= it.timelineStartMs && pos < it.timelineStartMs + it.durationMs }?.let { return it.id }
-    _timeline.value.overlayClips.find { pos >= it.timelineStartMs && pos < it.timelineStartMs + it.durationMs }?.let { return it.id }
-    _timeline.value.audioClips.find { pos >= it.timelineStartMs && pos < it.timelineStartMs + it.durationMs }?.let { return it.id }
-    _timeline.value.textClips.find { pos >= it.timelineStartMs && pos < it.timelineStartMs + it.durationMs }?.let { return it.id }
-    _timeline.value.stickerClips.find { pos >= it.timelineStartMs && pos < it.timelineStartMs + it.durationMs }?.let { return it.id }
-    _timeline.value.effectClips.find { pos >= it.timelineStartMs && pos < it.timelineStartMs + it.durationMs }?.let { return it.id }
-    return null
+    return _timeline.value.findClipUnderPlayhead(pos)
   }
 
   fun trimClip(clipId: String, newStartMs: Long, newDurationMs: Long) {
@@ -5403,5 +5724,107 @@ class TimelineEngine {
       _selectedElement.value = SelectedTrackElement.Audio(newClips.first().id)
     }
     return true
+  }
+
+  // --- Compound Clips & Nesting Operations ---
+
+  fun createCompoundClip(
+    clipIds: Set<String>,
+    name: String = "Compound Clip",
+    targetTrackType: TrackType = TrackType.MAIN_VIDEO
+  ): String? = withStateLock {
+    if (clipIds.isEmpty()) return null
+    val targetTrackId = when (targetTrackType) {
+      TrackType.MAIN_VIDEO -> "track_main_video"
+      TrackType.OVERLAY -> "track_overlay"
+      TrackType.AUDIO -> "track_audio"
+      TrackType.TEXT -> "track_text"
+      TrackType.STICKER -> "track_stickers"
+      TrackType.EFFECT -> "track_effects"
+    }
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Create Compound Clip", clipIds)
+    val (updated, compoundClip) = TimelineEditOperations.createCompoundClip(core, clipIds, name, targetTrackId)
+    if (compoundClip != null) {
+      _timeline.value = updated.toLegacyTimeline()
+      selectElement(findTrackElementForClip(compoundClip.id))
+      return compoundClip.id
+    }
+    return null
+  }
+
+  fun unpackCompoundClip(compoundClipId: String): Boolean = withStateLock {
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Unpack Compound Clip", setOf(compoundClipId))
+    val updated = TimelineEditOperations.unpackCompoundClip(core, compoundClipId)
+    if (updated != core) {
+      _timeline.value = updated.toLegacyTimeline()
+      _selectedElement.value = SelectedTrackElement.None
+      return true
+    }
+    return false
+  }
+
+  fun modifyNestedTimeline(
+    compoundClipId: String,
+    modifier: (CoreTimelineState) -> CoreTimelineState
+  ): Boolean = withStateLock {
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Modify Compound Clip", setOf(compoundClipId))
+    val updated = TimelineEditOperations.modifyNestedTimeline(core, compoundClipId, modifier)
+    if (updated != core) {
+      _timeline.value = updated.toLegacyTimeline()
+      return true
+    }
+    return false
+  }
+
+  // --- Clip Grouping Operations ---
+
+  fun groupClips(clipIds: Set<String>, groupName: String = "Group"): String? = withStateLock {
+    if (clipIds.size < 2) return null
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Group Clips", clipIds)
+    val (updated, group) = TimelineEditOperations.groupClips(core, clipIds, groupName)
+    _timeline.value = updated.toLegacyTimeline()
+    return group?.id
+  }
+
+  fun ungroupClips(groupId: String): Boolean = withStateLock {
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, "Ungroup Clips")
+    val updated = TimelineEditOperations.ungroupClips(core, groupId)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun moveGroup(groupId: String, deltaMs: Long): Boolean = withStateLock {
+    if (deltaMs == 0L) return false
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.MOVE_CLIP, "Move Group")
+    val updated = TimelineEditOperations.moveGroup(core, groupId, deltaMs * 1000L)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun setGroupLock(groupId: String, isLocked: Boolean): Boolean = withStateLock {
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, if (isLocked) "Lock Group" else "Unlock Group")
+    val updated = TimelineEditOperations.setGroupLock(core, groupId, isLocked)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun setGroupVisibility(groupId: String, isVisible: Boolean): Boolean = withStateLock {
+    val core = _timeline.value.toCoreTimeline(fps = _timelineFps.value, currentPlayheadMs = _currentPositionMs.value)
+    recordHistory(TimelineActionType.GENERIC_EDIT, if (isVisible) "Show Group" else "Hide Group")
+    val updated = TimelineEditOperations.setGroupVisibility(core, groupId, isVisible)
+    _timeline.value = updated.toLegacyTimeline()
+    return true
+  }
+
+  fun release() {
+    engineScope.cancel()
+    clearSnapIndicator()
   }
 }

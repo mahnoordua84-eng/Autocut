@@ -15,7 +15,19 @@ data class InterpolatedClipTransform(
   val brightness: Float = 0.0f,
   val contrast: Float = 1.0f,
   val saturation: Float = 1.0f,
-  val effectParam: Float = 0.0f
+  val effectParam: Float = 0.0f,
+  val cropLeft: Float = 0.0f,
+  val cropTop: Float = 0.0f,
+  val cropRight: Float = 0.0f,
+  val cropBottom: Float = 0.0f,
+  val temperature: Float = 0.0f,
+  val tint: Float = 0.0f,
+  val hue: Float = 0.0f,
+  val exposure: Float = 0.0f,
+  val vignette: Float = 0.0f,
+  val highlights: Float = 0.0f,
+  val shadows: Float = 0.0f,
+  val customProperties: Map<String, Float> = emptyMap()
 ) {
   // Legacy / convenience uniform scale
   val scale: Float get() = (scaleX + scaleY) / 2f
